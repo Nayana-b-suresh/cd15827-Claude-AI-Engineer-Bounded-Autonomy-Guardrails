@@ -1,7 +1,7 @@
 """Pydantic models that cross subagent boundaries.
 
 Every payload entering or leaving a subagent is one of these types. No untyped dicts
-travel between agents; the schema is the contract.
+travel between agents — the schema is the contract.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ Confidence = Literal["low", "medium", "high"]
 
 
 class DefectReport(BaseModel):
-    """Input to the coordinator; a single defect observation from the line."""
+    """Input to the coordinator — a single defect observation from the line."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -68,17 +68,32 @@ class Cause(BaseModel):
     cited_evidence: list[str] = Field(min_length=1)
 
 
-# TODO: Build the _ALLOWED_EVIDENCE_FIELDS frozenset below.
-# Each entry is a token a cited_evidence string may begin with. Include:
-#   - top-level container names: "defect_classification", "supplier_findings"
-#   - DefectClassification leaf fields: "defect_type", "severity", "description_summary"
-#   - SupplierFindings leaf fields: "component_records", "supplier_incident_summary"
-#   - ComponentRecord leaf fields: "component_id", "supplier", "lot_id", "received_at",
-#     "prior_incidents"
-#   - The refinement token "refinement" (used by the refinement loop later)
-# The allowlist is intentionally permissive (substring match, not exact equality), because
-# the model returns evidence strings like "defect_type=SOLDER-BRIDGE" rather than bare names.
-_ALLOWED_EVIDENCE_FIELDS: frozenset[str] = frozenset()
+# Evidence references must match one of these top-level field names in the input
+# DefectClassification or SupplierFindings — enforced in RootCauseHypothesis.
+_ALLOWED_EVIDENCE_FIELDS = frozenset(
+    {
+        # Top-level container names (e.g. "supplier_findings — no prior incidents")
+        "defect_classification",
+        "supplier_findings",
+        # DefectClassification leaf fields
+        "defect_type",
+        "severity",
+        "description_summary",
+        # SupplierFindings leaf fields
+        "component_records",
+        "supplier_incident_summary",
+        # ComponentRecord leaf fields (one level deeper in supplier_findings)
+        "component_id",
+        "supplier",
+        "lot_id",
+        "received_at",
+        "prior_incidents",
+        # The refinement instruction appears in the payload on re-investigation
+        # rounds; the model is allowed to cite it as evidence of the gap it is
+        # addressing.
+        "refinement",
+    }
+)
 
 
 class RootCauseHypothesis(BaseModel):
@@ -88,19 +103,21 @@ class RootCauseHypothesis(BaseModel):
 
     ranked_causes: list[Cause] = Field(min_length=1)
 
-    # TODO: Implement a Pydantic model_validator(mode="after") named
-    # `_evidence_must_reference_known_fields` that iterates over every Cause in
-    # ranked_causes and every entry in cause.cited_evidence. If an entry contains
-    # NONE of the tokens in _ALLOWED_EVIDENCE_FIELDS as a substring, raise a
-    # ValueError naming which cause's evidence is rejected.
-    #
-    # (Friction note: a model_validator(mode="after") method MUST return `self` at the
-    # end. If you forget, the validator silently runs but its checks won't surface as
-    # expected, and frozen=True hides the misbehavior even more.)
+    @model_validator(mode="after")
+    def _evidence_must_reference_known_fields(self) -> RootCauseHypothesis:
+        for i, cause in enumerate(self.ranked_causes):
+            for evidence in cause.cited_evidence:
+                if not any(field in evidence for field in _ALLOWED_EVIDENCE_FIELDS):
+                    raise ValueError(
+                        f"ranked_causes[{i}].cited_evidence entry "
+                        f"'{evidence}' does not reference any known "
+                        f"DefectClassification or SupplierFindings field"
+                    )
+        return self
 
 
 class SubagentReport(BaseModel):
-    """Output of the report subagent; the raw payload before refinement bookkeeping
+    """Output of the report subagent — the raw payload before refinement bookkeeping
     is added by the coordinator to produce a CorrectiveActionReport.
     """
 
