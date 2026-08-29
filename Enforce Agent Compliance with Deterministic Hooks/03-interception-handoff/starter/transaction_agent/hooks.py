@@ -2,11 +2,6 @@
 
 Each hook is a deterministic check — the enforcement is programmatic, not prompt-based, so a
 zero-tolerance rule (KYC before money movement, no over-threshold transfers) cannot leak.
-
-The KYC prerequisite gate and the PostToolUse normalization hook are complete from steps 1
-and 2. In this step you implement the interception path: ``score_risk_flags``,
-``build_handoff_summary``, and the ``amount_threshold_hook`` that redirects over-threshold
-transfers to compliance review.
 """
 from __future__ import annotations
 
@@ -37,8 +32,8 @@ _STATUS_KEYS = frozenset({"status", "status_code"})
 def kyc_prerequisite_hook(call: ToolCall, state: SessionState) -> HookDecision:
     """Block money-movement tools until ``verify_kyc`` has recorded a verified id for the customer.
 
-    The canonical prerequisite is "a tool returned a verified customer ID"; the engine records
-    that id on a successful ``verify_kyc`` and this hook gates on its presence.
+    The exam's canonical prerequisite is "a tool returned a verified customer ID"; the engine
+    records that id on a successful ``verify_kyc`` and this hook gates on its presence.
     """
     if call.name in MONEY_MOVEMENT_TOOLS:
         customer_id = call.input.get("customer_id")
@@ -94,14 +89,19 @@ def score_risk_flags(tool_input: dict[str, Any], customer: dict[str, Any]) -> li
     No trained model: a handful of rules that surface the flags a reviewer needs. The list is
     open/extensible, so escalation is multi-trigger rather than a single hardcoded condition.
     """
-    # TODO: Build and return a list of string risk flags from a few cheap rules:
-    #   - "over_threshold": coerce_money(tool_input.get("amount")).amount > TRANSFER_THRESHOLD
-    #   - "cross_border": tool_input["destination_country"] is set and differs from the
-    #     customer's "country"
-    #   - "round_amount": the amount is an exact multiple of 1000
-    #   - "dormant_account": the customer "status" is 2 or "dormant"
-    # Keep it open/extensible (append flags), not a single hardcoded condition.
-    raise NotImplementedError("TODO US-03: implement the cheap risk scorer")
+    flags: list[str] = []
+    amount = coerce_money(tool_input.get("amount")).amount
+    if amount > TRANSFER_THRESHOLD:
+        flags.append("over_threshold")
+    destination = tool_input.get("destination_country")
+    home = customer.get("country")
+    if destination and home and destination != home:
+        flags.append("cross_border")
+    if amount % 1000 == 0:
+        flags.append("round_amount")
+    if customer.get("status") in (2, "dormant"):
+        flags.append("dormant_account")
+    return flags
 
 
 def build_handoff_summary(tool_input: dict[str, Any], customer: dict[str, Any]) -> HandoffSummary:
@@ -109,13 +109,29 @@ def build_handoff_summary(tool_input: dict[str, Any], customer: dict[str, Any]) 
 
     A compliance officer acts on this without ever seeing the chat transcript.
     """
-    # TODO: Build a HandoffSummary whose every field traces to tool_input or the
-    # customer record — nothing from a transcript or prior turn. Coerce the amount with
-    # coerce_money. Use score_risk_flags(...) for risk_flags. Write a reason_for_escalation that
-    # names the amount and the threshold it breached (and the cross-border detail when that flag
-    # is present), and a concrete recommended_action. Populate customer_id, transaction_type
-    # (default "wire_transfer"), amount, origin_account, and destination_account from tool_input.
-    raise NotImplementedError("TODO US-03: build the self-contained handoff summary")
+    money = coerce_money(tool_input.get("amount"))
+    flags = score_risk_flags(tool_input, customer)
+    reason = (
+        f"Transfer amount {money.amount} {money.currency} exceeds the "
+        f"${TRANSFER_THRESHOLD} compliance review threshold."
+    )
+    if "cross_border" in flags:
+        reason += (
+            f" Destination ({tool_input.get('destination_country')}) is cross-border from "
+            f"the customer's home country ({customer.get('country')})."
+        )
+    return HandoffSummary(
+        customer_id=tool_input["customer_id"],
+        transaction_type=tool_input.get("transaction_type", "wire_transfer"),
+        amount=money,
+        origin_account=tool_input["origin_account"],
+        destination_account=tool_input["destination_account"],
+        risk_flags=flags,
+        reason_for_escalation=reason,
+        recommended_action=(
+            "Hold transfer; require manual compliance officer approval before release."
+        ),
+    )
 
 
 def make_amount_threshold_hook(load_customer_fn: CustomerLoader) -> Callable[..., HookDecision]:
@@ -126,13 +142,13 @@ def make_amount_threshold_hook(load_customer_fn: CustomerLoader) -> Callable[...
     """
 
     def amount_threshold_hook(call: ToolCall, state: SessionState) -> HookDecision:
-        # TODO: Return HookDecision.allow() for any tool that is not
-        # initiate_transfer. For initiate_transfer, coerce the amount with coerce_money; if it is
-        # strictly greater than TRANSFER_THRESHOLD, load the customer with load_customer_fn,
-        # build a handoff with build_handoff_summary, and return
-        # HookDecision.redirect("compliance_review_queue", handoff.model_dump(mode="json")).
-        # At or below the threshold, return HookDecision.allow().
-        raise NotImplementedError("TODO US-03: implement the interception + redirect hook")
+        if call.name != "initiate_transfer":
+            return HookDecision.allow()
+        if coerce_money(call.input.get("amount")).amount > TRANSFER_THRESHOLD:
+            customer = load_customer_fn(call.input["customer_id"])
+            handoff = build_handoff_summary(call.input, customer)
+            return HookDecision.redirect("compliance_review_queue", handoff.model_dump(mode="json"))
+        return HookDecision.allow()
 
     return amount_threshold_hook
 
