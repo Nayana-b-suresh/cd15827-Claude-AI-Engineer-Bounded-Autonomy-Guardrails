@@ -2,9 +2,6 @@
 
 Each hook is a deterministic check — the enforcement is programmatic, not prompt-based, so a
 zero-tolerance rule (KYC before money movement) cannot leak.
-
-The KYC prerequisite hook is already complete from step 1. In this step you implement
-``normalization_hook`` (a PostToolUse hook) and its two field-level helpers.
 """
 from __future__ import annotations
 
@@ -29,8 +26,8 @@ _STATUS_KEYS = frozenset({"status", "status_code"})
 def kyc_prerequisite_hook(call: ToolCall, state: SessionState) -> HookDecision:
     """Block money-movement tools until ``verify_kyc`` has recorded a verified id for the customer.
 
-    The canonical prerequisite is "a tool returned a verified customer ID"; the engine records
-    that id on a successful ``verify_kyc`` and this hook gates on its presence.
+    The exam's canonical prerequisite is "a tool returned a verified customer ID"; the engine
+    records that id on a successful ``verify_kyc`` and this hook gates on its presence.
     """
     if call.name in MONEY_MOVEMENT_TOOLS:
         customer_id = call.input.get("customer_id")
@@ -43,21 +40,19 @@ def kyc_prerequisite_hook(call: ToolCall, state: SessionState) -> HookDecision:
 
 
 def _normalize_monetary(value: Any) -> Any:
-    # TODO: If value is a currency string, return
-    # normalize_currency(value).to_serializable() (the canonical {"amount", "currency"} dict).
-    # If value is already a canonical Money dict (its keys are exactly {"amount", "currency"}),
-    # return it unchanged so the hook is idempotent. Numeric amounts and anything else pass
-    # through untouched (a bare number is not a currency string and must not be coerced here).
-    raise NotImplementedError("TODO US-02: normalize a monetary field value")
+    if isinstance(value, str):
+        return normalize_currency(value).to_serializable()
+    if isinstance(value, dict) and set(value) == {"amount", "currency"}:
+        return value  # already canonical Money — idempotent
+    return value  # numeric amounts and anything else pass through
 
 
 def _normalize_status_value(value: Any) -> Any:
-    # TODO: Normalize ONLY numeric status codes; pass strings through. Watch the
-    # sharp edge: get_customer returns a numeric status (1/2/3), but initiate_transfer returns
-    # status="executed". A hook that maps every status key crashes on "executed". So: leave bool
-    # untouched; for an int (or an all-digits string) call normalize_status(value); otherwise
-    # (an already-canonical label or a non-code string like "executed") return value unchanged.
-    raise NotImplementedError("TODO US-02: normalize a status field value")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
+        return normalize_status(value)
+    return value  # already a label, or a non-code string like "executed" — pass through
 
 
 def normalization_hook(
@@ -69,9 +64,14 @@ def normalization_hook(
     timestamps (``timestamp``, ``date``, ``*_at``) → ISO-8601 UTC; numeric status
     (``status``, ``status_code``) → canonical label. Unrecognized keys pass through unchanged.
     """
-    # TODO: Build and return a NEW dict. For each key/value in result, route by key
-    # family: monetary keys (in _MONETARY_KEYS or ending in "_balance") -> _normalize_monetary;
-    # timestamp keys (in _TIMESTAMP_KEYS or ending in "_at") -> normalize_timestamp, but pass a
-    # None value through untouched; status keys (in _STATUS_KEYS) -> _normalize_status_value;
-    # any other key -> copy the value unchanged.
-    raise NotImplementedError("TODO US-02: route each field to its normalizer by key family")
+    out: dict[str, Any] = {}
+    for key, value in result.items():
+        if key in _MONETARY_KEYS or key.endswith("_balance"):
+            out[key] = _normalize_monetary(value)
+        elif key in _TIMESTAMP_KEYS or key.endswith("_at"):
+            out[key] = value if value is None else normalize_timestamp(value)
+        elif key in _STATUS_KEYS:
+            out[key] = _normalize_status_value(value)
+        else:
+            out[key] = value
+    return out
