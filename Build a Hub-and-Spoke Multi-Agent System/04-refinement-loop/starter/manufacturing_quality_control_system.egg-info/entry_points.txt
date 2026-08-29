@@ -1,0 +1,2 @@
+[console_scripts]
+manufacturing-qc = manufacturing_qc.__main__:main

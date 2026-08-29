@@ -25,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("defect_report", type=Path)
     run_parser.add_argument("--db", type=Path, default=_DEFAULT_DB)
     run_parser.add_argument("--model", default="claude-haiku-4-5-20251001")
+    run_parser.add_argument("--max-refinements", type=int, default=1)
 
     args = parser.parse_args(argv)
 
@@ -33,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
         model=args.model,
         tool_handlers={"sqlite_lookup": lambda inp: sqlite_lookup(args.db, **inp)},
     )
-    coordinator = Coordinator(runner=runner)
+    coordinator = Coordinator(runner=runner, max_refinements=args.max_refinements)
     result = asyncio.run(coordinator.run(report))
     print(result.model_dump_json(indent=2))
     return 0
