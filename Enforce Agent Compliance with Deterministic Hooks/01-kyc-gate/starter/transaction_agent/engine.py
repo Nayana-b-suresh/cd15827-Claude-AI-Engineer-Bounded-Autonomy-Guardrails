@@ -6,10 +6,6 @@ Firing sites (the one ambiguity pinned by spec validation):
   function runs; the first non-``allow`` decision short-circuits and the tool never executes.
 * ``PostToolUse`` hooks fire **after** the tool function returns and **before** the result is
   handed back to the model, so the model only ever sees canonicalized data.
-
-In this step you implement ``run_pre`` and ``execute_tool_call`` — the two methods that
-make enforcement happen *in the engine*, before a tool runs. The registration plumbing and the
-business-error helper are provided.
 """
 from __future__ import annotations
 
@@ -59,12 +55,11 @@ class HookEngine:
 
     def run_pre(self, call: ToolCall, state: SessionState) -> HookDecision:
         """Run PreToolUse hooks in registration order, short-circuiting on the first non-allow."""
-        # TODO: Run each registered PreToolUse hook (they live in self._pre) in
-        # order, calling each with (call, state). The FIRST hook that returns a non-allow
-        # decision wins: return it immediately and do not run the remaining hooks. Use
-        # HookDecision.is_allow to test a decision. If every hook allows, return
-        # HookDecision.allow().
-        raise NotImplementedError("TODO US-01: implement PreToolUse short-circuit")
+        for hook in self._pre:
+            decision = hook(call, state)
+            if not decision.is_allow:
+                return decision
+        return HookDecision.allow()
 
     def run_post(
         self, tool_name: str, result: dict[str, Any], state: SessionState
@@ -81,22 +76,28 @@ class HookEngine:
         registry: Mapping[str, Any],
     ) -> ToolResult:
         """Enforce hooks, dispatch the tool if allowed, return the result the model will see."""
-        # TODO: Enforcement happens HERE, in the engine, before the tool runs —
-        # never inside the tool function. Implement the flow:
-        #   1. Read customer_id from call.input (it may be None).
-        #   2. decision = self.run_pre(call, state). Record it: self.log.record(call.name,
-        #      customer_id, decision.decision, decision.reason).
-        #   3. If decision.decision is DecisionType.DENY: return self._business_error(call.name,
-        #      decision.reason). The tool function must NOT be called.
-        #   4. If decision.decision is DecisionType.REDIRECT: append decision.payload (or {}) to
-        #      the queue named by decision.target (default "compliance_review_queue") in
-        #      self.queues, then return a self._business_error explaining the call was held for
-        #      review. (Redirect is exercised in a later step; wire it now so the engine is whole.)
-        #   5. Otherwise the call is allowed: raw = registry[call.name](**call.input); run it
-        #      through self.run_post(call.name, raw, state). If this call was a successful
-        #      verify_kyc (the result has a truthy "kyc_verified" and a "customer_id"), add that
-        #      id to state.verified_customers. Return a non-error ToolResult wrapping the result.
-        raise NotImplementedError("TODO US-01: implement engine enforcement + dispatch")
+        customer_id = call.input.get("customer_id")
+        decision = self.run_pre(call, state)
+        self.log.record(call.name, customer_id, decision.decision, decision.reason)
+
+        if decision.decision is DecisionType.DENY:
+            return self._business_error(call.name, decision.reason)
+
+        if decision.decision is DecisionType.REDIRECT:
+            target = decision.target or "compliance_review_queue"
+            self.queues.setdefault(target, []).append(decision.payload or {})
+            return self._business_error(
+                call.name,
+                f"{decision.reason}: transfer held for human compliance review, not executed.",
+            )
+
+        raw = registry[call.name](**call.input)
+        result = self.run_post(call.name, raw, state)
+
+        if call.name == "verify_kyc" and result.get("kyc_verified") and result.get("customer_id"):
+            state.verified_customers.add(result["customer_id"])
+
+        return ToolResult(tool_name=call.name, content=result, is_error=False)
 
     @staticmethod
     def _business_error(tool_name: str, reason: str) -> ToolResult:
